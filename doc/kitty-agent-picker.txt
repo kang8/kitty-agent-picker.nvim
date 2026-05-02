@@ -34,8 +34,8 @@ FEATURES                 *kitty-agent-picker-kitty-agent-picker.nvim-features*
 - Floating picker for multiple matches, rendered as an approximate Kitty split
     layout.
 - Directional keys: `h`, `j`, `k`, `l`; uppercase variants are used for a
-    second target in the same direction, and extra letter keys are assigned
-    when more targets are present.
+    second target in the same direction, and extra letter keys are assigned when
+    more targets are present.
 - Remembers the last selected window per target so `Enter` can select it again.
 - Configurable targets, so tools such as `aider` can be added.
 
