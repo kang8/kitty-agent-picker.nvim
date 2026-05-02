@@ -51,6 +51,29 @@ describe("layout helpers", function()
     assert.are.equal("L", group_keys[2])
   end)
 
+  it("assigns extra letters after two targets in the same direction", function()
+    local keymap, group_keys, available_keys = plugin._private.assign_direction_keys({ 2, 3, 4 }, {
+      [1] = { col = 0, row = 0 },
+      [2] = { col = 1, row = 0, dir = "right" },
+      [3] = { col = 2, row = 0, dir = "right" },
+      [4] = { col = 3, row = 0, dir = "right" },
+    }, {
+      [2] = { window_id = 20 },
+      [3] = { window_id = 30 },
+      [4] = { window_id = 40 },
+    }, {
+      [40] = 1,
+      [30] = 2,
+      [20] = 3,
+    })
+
+    assert.are.equal(4, keymap.l)
+    assert.are.equal(3, keymap.L)
+    assert.are.equal(2, keymap.f)
+    assert.are.equal("f", group_keys[2])
+    assert.are.same({ "l", "L", "f" }, available_keys)
+  end)
+
   it("centers and truncates by display width", function()
     assert.are.equal(" hi ", plugin._private.center_text("hi", 4))
     assert.are.equal("abcd", plugin._private.center_text("abcde", 4))

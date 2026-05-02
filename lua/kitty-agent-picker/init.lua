@@ -381,7 +381,40 @@ local function compute_spans(positions, group_neighbors)
   return spans
 end
 
+local directions = { "left", "bottom", "top", "right" }
 local dir_to_key = { left = "h", bottom = "j", top = "k", right = "l" }
+local extra_keys = {
+  "f",
+  "d",
+  "s",
+  "a",
+  "g",
+  "r",
+  "e",
+  "w",
+  "q",
+  "t",
+  "y",
+  "u",
+  "i",
+  "o",
+  "p",
+  "v",
+  "c",
+  "x",
+  "z",
+  "b",
+  "n",
+  "m",
+}
+
+local function sort_by_recency(group_ids, group_meta, history_rank)
+  table.sort(group_ids, function(a, b)
+    local wa = group_meta[a].window_id
+    local wb = group_meta[b].window_id
+    return (history_rank[wa] or math.huge) < (history_rank[wb] or math.huge)
+  end)
+end
 
 local function assign_direction_keys(target_group_ids, positions, group_meta, history_rank)
   local buckets = { left = {}, right = {}, top = {}, bottom = {} }
@@ -391,28 +424,44 @@ local function assign_direction_keys(target_group_ids, positions, group_meta, hi
       table.insert(buckets[pos.dir], gid)
     end
   end
-  for _, bucket in pairs(buckets) do
-    table.sort(bucket, function(a, b)
-      local wa = group_meta[a].window_id
-      local wb = group_meta[b].window_id
-      return (history_rank[wa] or math.huge) < (history_rank[wb] or math.huge)
-    end)
+  for _, dir in ipairs(directions) do
+    sort_by_recency(buckets[dir], group_meta, history_rank)
   end
   local keymap = {}
   local group_keys = {}
-  for dir, bucket in pairs(buckets) do
+  local available_keys = {}
+  local unassigned_group_ids = {}
+
+  for _, dir in ipairs(directions) do
+    local bucket = buckets[dir]
     local lower = dir_to_key[dir]
     local upper = lower:upper()
     if bucket[1] then
       keymap[lower] = bucket[1]
       group_keys[bucket[1]] = lower
+      table.insert(available_keys, lower)
     end
     if bucket[2] then
       keymap[upper] = bucket[2]
       group_keys[bucket[2]] = upper
+      table.insert(available_keys, upper)
+    end
+    for i = 3, #bucket do
+      table.insert(unassigned_group_ids, bucket[i])
     end
   end
-  return keymap, group_keys
+
+  sort_by_recency(unassigned_group_ids, group_meta, history_rank)
+  for i, gid in ipairs(unassigned_group_ids) do
+    local key = extra_keys[i]
+    if not key then
+      break
+    end
+    keymap[key] = gid
+    group_keys[gid] = key
+    table.insert(available_keys, key)
+  end
+  return keymap, group_keys, available_keys
 end
 
 local function center_text(s, width)
@@ -668,16 +717,11 @@ function M.pick(opts, callback)
 
   local positions = compute_layout(topo.self_group_id, topo.group_neighbors)
   local spans = compute_spans(positions, topo.group_neighbors)
-  local keymap, group_keys = assign_direction_keys(target_group_ids, positions, topo.group_meta, topo.history_rank)
+  local keymap, group_keys, available =
+    assign_direction_keys(target_group_ids, positions, topo.group_meta, topo.history_rank)
   local default_group_id = find_last_group_id(target, target_group_ids, topo.group_meta)
   local grid_lines = render_layout_grid(spans, topo.self_group_id, topo.group_meta, group_keys, default_group_id)
 
-  local available = {}
-  for _, k in ipairs({ "h", "j", "k", "l", "H", "J", "K", "L" }) do
-    if keymap[k] then
-      table.insert(available, k)
-    end
-  end
   table.insert(grid_lines, "")
   table.insert(
     grid_lines,
