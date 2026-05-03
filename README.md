@@ -14,12 +14,9 @@ configuration a stable target window id.
 - Detects targets by window title, last reported command line, or foreground
   process command line.
 - Fast path for zero or one match.
-- Floating picker for multiple matches, rendered as an approximate Kitty split
-  layout.
-- Directional keys: `h`, `j`, `k`, `l`; uppercase variants are used for a
-  second target in the same direction, and extra letter keys are assigned when
-  more targets are present.
-- Remembers the last selected window per target so `Enter` can select it again.
+- Uses Kitty's native `kitten @ select-window` UI when multiple targets match.
+- Validates the selected Kitty window against the configured target before
+  returning it.
 - Configurable targets, so tools such as `aider` can be added.
 
 ## Requirements
@@ -34,7 +31,7 @@ allow_remote_control yes
 ```
 
 If you use a socket-based setup, configure Kitty and your environment so
-`kitty @ ls` works from inside Neovim.
+`kitty @ ls` and `kitten @ select-window` work from inside Neovim.
 
 ## Installation
 
@@ -97,9 +94,7 @@ There is also a lightweight debug command:
 ```lua
 require("kitty-agent-picker").setup({
   kitty_ls_cmd = { "kitty", "@", "ls" },
-  state_file = vim.fn.stdpath("state") .. "/kitty-agent-picker/last.json",
-  cell_width = 15,
-  cell_height = 4,
+  kitty_select_window_cmd = { "kitten", "@", "select-window", "--self", "--exclude-active" },
   targets = {
     aider = {
       display_name = "Aider",
@@ -111,6 +106,10 @@ require("kitty-agent-picker").setup({
 
 `targets` is merged with the defaults, so the snippet above adds `aider` without
 removing `claude`, `codex`, or `agent`.
+
+When multiple configured targets match, Kitty's native selector may display
+other windows in the tab as well. The plugin returns `nil` if the selected
+window is not one of the matching target windows.
 
 ## API
 

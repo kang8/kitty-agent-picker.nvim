@@ -1,9 +1,19 @@
 local plugin = require("kitty-agent-picker")
 
 local function reset(opts)
-  plugin.setup(vim.tbl_deep_extend("force", {
-    state_file = vim.fn.tempname(),
-  }, opts or {}))
+  plugin.setup(opts or {})
+end
+
+local function payload_with_windows(windows)
+  return vim.fn.json_encode({
+    {
+      tabs = {
+        {
+          windows = windows,
+        },
+      },
+    },
+  })
 end
 
 describe("setup", function()
@@ -31,55 +41,6 @@ describe("setup", function()
   end)
 end)
 
-describe("layout helpers", function()
-  it("assigns direction keys by recency", function()
-    local keymap, group_keys = plugin._private.assign_direction_keys({ 2, 3 }, {
-      [1] = { col = 0, row = 0 },
-      [2] = { col = 1, row = 0, dir = "right" },
-      [3] = { col = 2, row = 0, dir = "right" },
-    }, {
-      [2] = { window_id = 20 },
-      [3] = { window_id = 30 },
-    }, {
-      [30] = 1,
-      [20] = 2,
-    })
-
-    assert.are.equal(3, keymap.l)
-    assert.are.equal(2, keymap.L)
-    assert.are.equal("l", group_keys[3])
-    assert.are.equal("L", group_keys[2])
-  end)
-
-  it("assigns extra letters after two targets in the same direction", function()
-    local keymap, group_keys, available_keys = plugin._private.assign_direction_keys({ 2, 3, 4 }, {
-      [1] = { col = 0, row = 0 },
-      [2] = { col = 1, row = 0, dir = "right" },
-      [3] = { col = 2, row = 0, dir = "right" },
-      [4] = { col = 3, row = 0, dir = "right" },
-    }, {
-      [2] = { window_id = 20 },
-      [3] = { window_id = 30 },
-      [4] = { window_id = 40 },
-    }, {
-      [40] = 1,
-      [30] = 2,
-      [20] = 3,
-    })
-
-    assert.are.equal(4, keymap.l)
-    assert.are.equal(3, keymap.L)
-    assert.are.equal(2, keymap.f)
-    assert.are.equal("f", group_keys[2])
-    assert.are.same({ "l", "L", "f" }, available_keys)
-  end)
-
-  it("centers and truncates by display width", function()
-    assert.are.equal(" hi ", plugin._private.center_text("hi", 4))
-    assert.are.equal("abcd", plugin._private.center_text("abcde", 4))
-  end)
-end)
-
 describe("pick", function()
   before_each(function()
     reset()
@@ -96,38 +57,23 @@ describe("pick", function()
     assert.is_nil(actual)
   end)
 
-  it("selects the only matching target without opening UI", function()
-    local payload = vim.fn.json_encode({
+  it("selects the only matching target without opening native UI", function()
+    local payload = payload_with_windows({
       {
-        tabs = {
-          {
-            active_window_history = { 101, 102 },
-            groups = {
-              { id = 1, windows = { 101 } },
-              { id = 2, windows = { 102 } },
-            },
-            windows = {
-              {
-                id = 101,
-                is_self = true,
-                cwd = "/repo",
-                title = "nvim",
-                neighbors = { right = { 2 } },
-              },
-              {
-                id = 102,
-                cwd = "/repo",
-                title = "claude",
-                last_reported_cmdline = "claude",
-                foreground_processes = {},
-                neighbors = { left = { 1 } },
-              },
-            },
-          },
-        },
+        id = 101,
+        is_self = true,
+        cwd = "/repo",
+        title = "nvim",
+      },
+      {
+        id = 102,
+        cwd = "/repo",
+        title = "claude",
+        last_reported_cmdline = "claude",
+        foreground_processes = {},
       },
     })
-    reset({ kitty_ls_cmd = { "printf", "%s", payload } })
+    reset({ kitty_ls_cmd = { "printf", "%s", payload }, kitty_select_window_cmd = { "false" } })
     local actual
 
     plugin.pick(function(selection)
@@ -137,5 +83,156 @@ describe("pick", function()
     assert.are.equal(102, actual.id)
     assert.are.equal("/repo", actual.cwd)
     assert.are.equal("Claude", actual.agent_name)
+  end)
+
+  it("uses native selection when multiple targets match", function()
+    local payload = payload_with_windows({
+      {
+        id = 101,
+        is_self = true,
+        cwd = "/repo",
+        title = "nvim",
+      },
+      {
+        id = 102,
+        cwd = "/claude",
+        title = "claude",
+        last_reported_cmdline = "claude",
+        foreground_processes = {},
+      },
+      {
+        id = 103,
+        cwd = "/codex",
+        title = "codex",
+        last_reported_cmdline = "codex",
+        foreground_processes = {},
+      },
+    })
+    reset({
+      kitty_ls_cmd = { "printf", "%s", payload },
+      kitty_select_window_cmd = { "sh", "-c", "printf '103\\n'" },
+    })
+    local actual
+
+    plugin.pick({ target = "agent" }, function(selection)
+      actual = selection
+    end)
+
+    assert.are.equal(103, actual.id)
+    assert.are.equal("/codex", actual.cwd)
+    assert.are.equal("Codex", actual.agent_name)
+  end)
+
+  it("returns nil when native selection chooses a non-target window", function()
+    local payload = payload_with_windows({
+      {
+        id = 101,
+        is_self = true,
+        cwd = "/repo",
+        title = "nvim",
+      },
+      {
+        id = 102,
+        cwd = "/claude",
+        title = "claude",
+        last_reported_cmdline = "claude",
+        foreground_processes = {},
+      },
+      {
+        id = 103,
+        cwd = "/codex",
+        title = "codex",
+        last_reported_cmdline = "codex",
+        foreground_processes = {},
+      },
+      {
+        id = 104,
+        cwd = "/shell",
+        title = "zsh",
+        foreground_processes = {},
+      },
+    })
+    reset({
+      kitty_ls_cmd = { "printf", "%s", payload },
+      kitty_select_window_cmd = { "sh", "-c", "printf '104\\n'" },
+    })
+    local actual = "unset"
+
+    plugin.pick({ target = "agent" }, function(selection)
+      actual = selection
+    end)
+
+    assert.is_nil(actual)
+  end)
+
+  it("returns nil when native selection is cancelled", function()
+    local payload = payload_with_windows({
+      {
+        id = 101,
+        is_self = true,
+        cwd = "/repo",
+        title = "nvim",
+      },
+      {
+        id = 102,
+        cwd = "/claude",
+        title = "claude",
+        last_reported_cmdline = "claude",
+        foreground_processes = {},
+      },
+      {
+        id = 103,
+        cwd = "/codex",
+        title = "codex",
+        last_reported_cmdline = "codex",
+        foreground_processes = {},
+      },
+    })
+    reset({
+      kitty_ls_cmd = { "printf", "%s", payload },
+      kitty_select_window_cmd = { "false" },
+    })
+    local actual = "unset"
+
+    plugin.pick({ target = "agent" }, function(selection)
+      actual = selection
+    end)
+
+    assert.is_nil(actual)
+  end)
+
+  it("supports custom targets", function()
+    local payload = payload_with_windows({
+      {
+        id = 101,
+        is_self = true,
+        cwd = "/repo",
+        title = "nvim",
+      },
+      {
+        id = 102,
+        cwd = "/aider",
+        title = "aider",
+        last_reported_cmdline = "aider",
+        foreground_processes = {},
+      },
+    })
+    reset({
+      kitty_ls_cmd = { "printf", "%s", payload },
+      targets = {
+        aider = {
+          display_name = "Aider",
+          patterns = { "aider" },
+        },
+      },
+    })
+    local actual
+
+    plugin.pick({ target = "aider" }, function(selection)
+      actual = selection
+    end)
+
+    assert.are.equal(102, actual.id)
+    assert.are.equal("Aider", actual.agent_name)
   end)
 end)

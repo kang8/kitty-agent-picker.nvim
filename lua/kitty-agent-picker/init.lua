@@ -6,14 +6,12 @@ local M = {}
 
 ---@class KittyAgentPickerConfig
 ---@field kitty_ls_cmd string[]
----@field state_file string
+---@field kitty_select_window_cmd string[]
 ---@field targets table<string, KittyAgentPickerTarget>
----@field cell_width integer
----@field cell_height integer
 
 local defaults = {
   kitty_ls_cmd = { "kitty", "@", "ls" },
-  state_file = vim.fn.stdpath("state") .. "/kitty-agent-picker/last.json",
+  kitty_select_window_cmd = { "kitten", "@", "select-window", "--self", "--exclude-active" },
   targets = {
     claude = {
       display_name = "Claude",
@@ -28,8 +26,6 @@ local defaults = {
       patterns = { "claude", "codex" },
     },
   },
-  cell_width = 15,
-  cell_height = 4,
 }
 
 M.config = vim.deepcopy(defaults)
@@ -90,65 +86,16 @@ local function window_matches_target(window, target)
   return false, nil
 end
 
-local function read_last_state()
-  local f = io.open(M.config.state_file, "r")
-  if not f then
-    return {}
-  end
-  local content = f:read("*a")
-  f:close()
-  if content == "" then
-    return {}
-  end
-  local ok, data = pcall(vim.fn.json_decode, content)
-  if not ok or type(data) ~= "table" then
-    return {}
-  end
-  return data
-end
-
-local function write_last_state(state)
-  local dir = vim.fn.fnamemodify(M.config.state_file, ":h")
-  vim.fn.mkdir(dir, "p")
-  local encoded = vim.fn.json_encode(state)
-  local f = io.open(M.config.state_file, "w")
-  if not f then
-    return
-  end
-  f:write(encoded)
-  f:close()
-end
-
-local function remember_last_window(target, meta)
-  if not meta or not meta.window_id then
-    return
-  end
-  local state = read_last_state()
-  state[target] = {
-    window_id = meta.window_id,
+local function selection_from_meta(meta, display_name)
+  return {
+    id = meta.window_id,
     cwd = meta.cwd,
     title = meta.title,
-    agent_name = meta.agent_name,
-    updated_at = os.time(),
+    agent_name = meta.agent_name or display_name,
   }
-  write_last_state(state)
 end
 
-local function find_last_group_id(target, target_group_ids, group_meta)
-  local last = read_last_state()[target]
-  if type(last) ~= "table" or not last.window_id then
-    return nil
-  end
-  for _, gid in ipairs(target_group_ids) do
-    local meta = group_meta[gid]
-    if meta and meta.window_id == last.window_id then
-      return gid
-    end
-  end
-  return nil
-end
-
-local function collect_tab_topology(target)
+local function collect_target_windows(target)
   local output = vim.fn.system(M.config.kitty_ls_cmd)
   if vim.v.shell_error ~= 0 then
     return nil
@@ -167,65 +114,29 @@ local function collect_tab_topology(target)
           break
         end
       end
+
       if self_window_id then
-        local groups = {}
-        for _, g in ipairs(tab.groups or {}) do
-          groups[g.id] = g.windows or {}
-        end
-
-        local window_to_group = {}
-        for gid, wids in pairs(groups) do
-          for _, wid in ipairs(wids) do
-            window_to_group[wid] = gid
-          end
-        end
-
-        local group_neighbors = {}
-        local group_meta = {}
+        local targets = {}
+        local targets_by_id = {}
         for _, w in ipairs(tab.windows or {}) do
-          local gid = window_to_group[w.id]
-          if gid then
-            local merged = group_neighbors[gid] or { left = {}, right = {}, top = {}, bottom = {} }
-            for dir, gids in pairs(w.neighbors or {}) do
-              merged[dir] = merged[dir] or {}
-              for _, ngid in ipairs(gids) do
-                table.insert(merged[dir], ngid)
-              end
-            end
-            group_neighbors[gid] = merged
-
-            local meta = group_meta[gid] or { is_target = false }
+          if w.id ~= self_window_id then
             local matches_target, agent_name = window_matches_target(w, target)
             if matches_target then
-              meta.is_target = true
-              meta.agent_name = agent_name
-              meta.window_id = w.id
-              meta.cwd = w.cwd
-              meta.title = w.title
-            elseif not meta.window_id then
-              meta.window_id = w.id
-              meta.cwd = w.cwd
-              meta.title = w.title
+              local meta = {
+                window_id = w.id,
+                cwd = w.cwd,
+                title = w.title,
+                agent_name = agent_name,
+              }
+              table.insert(targets, meta)
+              targets_by_id[w.id] = meta
             end
-            meta.lines = w.lines
-            meta.columns = w.columns
-            group_meta[gid] = meta
           end
-        end
-
-        local history = tab.active_window_history or {}
-        local rank = {}
-        for i = #history, 1, -1 do
-          rank[history[i]] = #history - i + 1
         end
 
         return {
-          self_window_id = self_window_id,
-          self_group_id = window_to_group[self_window_id],
-          groups = groups,
-          group_neighbors = group_neighbors,
-          group_meta = group_meta,
-          history_rank = rank,
+          targets = targets,
+          targets_by_id = targets_by_id,
         }
       end
     end
@@ -233,439 +144,20 @@ local function collect_tab_topology(target)
   return nil
 end
 
-local directions = { "right", "bottom", "left", "top" }
-local delta = {
-  left = { -1, 0 },
-  right = { 1, 0 },
-  top = { 0, -1 },
-  bottom = { 0, 1 },
-}
-local perp = {
-  left = { 0, 1 },
-  right = { 0, 1 },
-  top = { 1, 0 },
-  bottom = { 1, 0 },
-}
+local function select_window_id(display_name)
+  local cmd = vim.deepcopy(M.config.kitty_select_window_cmd)
+  table.insert(cmd, "--title")
+  table.insert(cmd, "Pick " .. display_name)
 
-local function compute_layout(self_group_id, group_neighbors)
-  local positions = { [self_group_id] = { col = 0, row = 0, dir = nil } }
-  local occupied = { [self_group_id] = true }
-  local function key(c, r)
-    return c .. "," .. r
+  local output = vim.fn.system(cmd)
+  if vim.v.shell_error ~= 0 then
+    return nil
   end
-  local cell_owner = { [key(0, 0)] = self_group_id }
-  local queue = { self_group_id }
-  local head = 1
-  while head <= #queue do
-    local gid = queue[head]
-    head = head + 1
-    local pos = positions[gid]
-    local neighbors = group_neighbors[gid] or {}
-    for _, dir in ipairs(directions) do
-      local list = neighbors[dir] or {}
-      local dx, dy = delta[dir][1], delta[dir][2]
-      local px, py = perp[dir][1], perp[dir][2]
-      for i, ngid in ipairs(list) do
-        if not occupied[ngid] then
-          local nc = pos.col + dx + (i - 1) * px
-          local nr = pos.row + dy + (i - 1) * py
-          while cell_owner[key(nc, nr)] do
-            nc = nc + px
-            nr = nr + py
-          end
-          positions[ngid] = {
-            col = nc,
-            row = nr,
-            dir = pos.dir or dir,
-          }
-          occupied[ngid] = true
-          cell_owner[key(nc, nr)] = ngid
-          table.insert(queue, ngid)
-        end
-      end
-    end
+  output = vim.trim(output)
+  if output == "" then
+    return nil
   end
-  return positions
-end
-
-local function compute_spans(positions, group_neighbors)
-  local cell_owner = {}
-  for gid, pos in pairs(positions) do
-    cell_owner[pos.col .. "," .. pos.row] = gid
-  end
-  local spans = {}
-  for gid, pos in pairs(positions) do
-    local row_lo, row_hi = pos.row, pos.row
-    local col_lo, col_hi = pos.col, pos.col
-    local neighbors = group_neighbors[gid] or {}
-    for _, dir in ipairs({ "left", "right" }) do
-      for _, ngid in ipairs(neighbors[dir] or {}) do
-        local np = positions[ngid]
-        if np then
-          row_lo = math.min(row_lo, np.row)
-          row_hi = math.max(row_hi, np.row)
-        end
-      end
-    end
-    for _, dir in ipairs({ "top", "bottom" }) do
-      for _, ngid in ipairs(neighbors[dir] or {}) do
-        local np = positions[ngid]
-        if np then
-          col_lo = math.min(col_lo, np.col)
-          col_hi = math.max(col_hi, np.col)
-        end
-      end
-    end
-    while row_lo < pos.row do
-      local blocked = false
-      for c = col_lo, col_hi do
-        local owner = cell_owner[c .. "," .. row_lo]
-        if owner and owner ~= gid then
-          blocked = true
-          break
-        end
-      end
-      if blocked then
-        row_lo = row_lo + 1
-      else
-        break
-      end
-    end
-    while row_hi > pos.row do
-      local blocked = false
-      for c = col_lo, col_hi do
-        local owner = cell_owner[c .. "," .. row_hi]
-        if owner and owner ~= gid then
-          blocked = true
-          break
-        end
-      end
-      if blocked then
-        row_hi = row_hi - 1
-      else
-        break
-      end
-    end
-    while col_lo < pos.col do
-      local blocked = false
-      for r = row_lo, row_hi do
-        local owner = cell_owner[col_lo .. "," .. r]
-        if owner and owner ~= gid then
-          blocked = true
-          break
-        end
-      end
-      if blocked then
-        col_lo = col_lo + 1
-      else
-        break
-      end
-    end
-    while col_hi > pos.col do
-      local blocked = false
-      for r = row_lo, row_hi do
-        local owner = cell_owner[col_hi .. "," .. r]
-        if owner and owner ~= gid then
-          blocked = true
-          break
-        end
-      end
-      if blocked then
-        col_hi = col_hi - 1
-      else
-        break
-      end
-    end
-    spans[gid] = { col_lo = col_lo, col_hi = col_hi, row_lo = row_lo, row_hi = row_hi }
-  end
-  return spans
-end
-
-local directions = { "left", "bottom", "top", "right" }
-local dir_to_key = { left = "h", bottom = "j", top = "k", right = "l" }
-local extra_keys = {
-  "f",
-  "d",
-  "s",
-  "a",
-  "g",
-  "r",
-  "e",
-  "w",
-  "q",
-  "t",
-  "y",
-  "u",
-  "i",
-  "o",
-  "p",
-  "v",
-  "c",
-  "x",
-  "z",
-  "b",
-  "n",
-  "m",
-}
-
-local function sort_by_recency(group_ids, group_meta, history_rank)
-  table.sort(group_ids, function(a, b)
-    local wa = group_meta[a].window_id
-    local wb = group_meta[b].window_id
-    return (history_rank[wa] or math.huge) < (history_rank[wb] or math.huge)
-  end)
-end
-
-local function assign_direction_keys(target_group_ids, positions, group_meta, history_rank)
-  local buckets = { left = {}, right = {}, top = {}, bottom = {} }
-  for _, gid in ipairs(target_group_ids) do
-    local pos = positions[gid]
-    if pos and pos.dir then
-      table.insert(buckets[pos.dir], gid)
-    end
-  end
-  for _, dir in ipairs(directions) do
-    sort_by_recency(buckets[dir], group_meta, history_rank)
-  end
-  local keymap = {}
-  local group_keys = {}
-  local available_keys = {}
-  local unassigned_group_ids = {}
-
-  for _, dir in ipairs(directions) do
-    local bucket = buckets[dir]
-    local lower = dir_to_key[dir]
-    local upper = lower:upper()
-    if bucket[1] then
-      keymap[lower] = bucket[1]
-      group_keys[bucket[1]] = lower
-      table.insert(available_keys, lower)
-    end
-    if bucket[2] then
-      keymap[upper] = bucket[2]
-      group_keys[bucket[2]] = upper
-      table.insert(available_keys, upper)
-    end
-    for i = 3, #bucket do
-      table.insert(unassigned_group_ids, bucket[i])
-    end
-  end
-
-  sort_by_recency(unassigned_group_ids, group_meta, history_rank)
-  for i, gid in ipairs(unassigned_group_ids) do
-    local key = extra_keys[i]
-    if not key then
-      break
-    end
-    keymap[key] = gid
-    group_keys[gid] = key
-    table.insert(available_keys, key)
-  end
-  return keymap, group_keys, available_keys
-end
-
-local function center_text(s, width)
-  s = s or ""
-  local dw = vim.fn.strdisplaywidth(s)
-  if dw >= width then
-    while dw > width and #s > 0 do
-      s = vim.fn.strcharpart(s, 0, vim.fn.strchars(s) - 1)
-      dw = vim.fn.strdisplaywidth(s)
-    end
-    return s .. string.rep(" ", width - dw)
-  end
-  local left = math.floor((width - dw) / 2)
-  local right = width - dw - left
-  return string.rep(" ", left) .. s .. string.rep(" ", right)
-end
-
-local function render_layout_grid(spans, self_group_id, group_meta, group_keys, default_group_id)
-  local min_c, max_c, min_r, max_r = 0, 0, 0, 0
-  for _, span in pairs(spans) do
-    min_c = math.min(min_c, span.col_lo)
-    max_c = math.max(max_c, span.col_hi)
-    min_r = math.min(min_r, span.row_lo)
-    max_r = math.max(max_r, span.row_hi)
-  end
-  local cols = max_c - min_c + 1
-  local rows = max_r - min_r + 1
-  local cell_w = M.config.cell_width
-  local cell_h = M.config.cell_height
-
-  local owned_cells = {}
-  for gid, span in pairs(spans) do
-    table.insert(owned_cells, {
-      gid = gid,
-      c_lo = span.col_lo - min_c + 1,
-      c_hi = span.col_hi - min_c + 1,
-      r_lo = span.row_lo - min_r + 1,
-      r_hi = span.row_hi - min_r + 1,
-    })
-  end
-
-  local total_w = cols * (cell_w - 1) + 1
-  local total_h = rows * (cell_h - 1) + 1
-  local buf = {}
-  for y = 1, total_h do
-    buf[y] = {}
-    for x = 1, total_w do
-      buf[y][x] = " "
-    end
-  end
-
-  local function cell_origin(c, r)
-    return (c - 1) * (cell_w - 1) + 1, (r - 1) * (cell_h - 1) + 1
-  end
-
-  local horiz = {}
-  local vert = {}
-  for y = 1, total_h do
-    horiz[y] = {}
-    vert[y] = {}
-  end
-
-  for _, cell in ipairs(owned_cells) do
-    local x0, y0 = cell_origin(cell.c_lo, cell.r_lo)
-    local x1 = cell.c_hi * (cell_w - 1) + 1
-    local y1 = cell.r_hi * (cell_h - 1) + 1
-    for x = x0, x1 - 1 do
-      horiz[y0][x] = true
-      horiz[y1][x] = true
-    end
-    for y = y0, y1 - 1 do
-      vert[y][x0] = true
-      vert[y][x1] = true
-    end
-  end
-
-  for y = 1, total_h do
-    for x = 1, total_w do
-      local up = (y > 1 and vert[y - 1] and vert[y - 1][x]) and true or false
-      local down = (vert[y] and vert[y][x]) and true or false
-      local left = (x > 1 and horiz[y] and horiz[y][x - 1]) and true or false
-      local right = (horiz[y] and horiz[y][x]) and true or false
-      local count = (up and 1 or 0) + (down and 1 or 0) + (left and 1 or 0) + (right and 1 or 0)
-      local ch = nil
-      if count == 4 then
-        ch = "┼"
-      elseif count == 3 then
-        if not up then
-          ch = "┬"
-        elseif not down then
-          ch = "┴"
-        elseif not left then
-          ch = "├"
-        else
-          ch = "┤"
-        end
-      elseif count == 2 then
-        if up and down then
-          ch = "│"
-        elseif left and right then
-          ch = "─"
-        elseif down and right then
-          ch = "┌"
-        elseif down and left then
-          ch = "┐"
-        elseif up and right then
-          ch = "└"
-        else
-          ch = "┘"
-        end
-      elseif count == 1 then
-        ch = (left or right) and "─" or "│"
-      end
-      if ch then
-        buf[y][x] = ch
-      end
-    end
-  end
-
-  for _, cell in ipairs(owned_cells) do
-    local gid = cell.gid
-    local meta = group_meta[gid] or {}
-    local label, name
-    if gid == self_group_id then
-      label = "[*]"
-      name = "nvim"
-    elseif gid == default_group_id and group_keys[gid] then
-      label = "[" .. group_keys[gid] .. "/Enter]"
-      name = vim.fn.fnamemodify(meta.cwd or "", ":t")
-    elseif gid == default_group_id then
-      label = "[Enter]"
-      name = vim.fn.fnamemodify(meta.cwd or "", ":t")
-    elseif group_keys[gid] then
-      label = "[" .. group_keys[gid] .. "]"
-      name = vim.fn.fnamemodify(meta.cwd or "", ":t")
-    else
-      label = " "
-      name = vim.fn.fnamemodify(meta.cwd or "", ":t")
-    end
-
-    local x0, y0 = cell_origin(cell.c_lo, cell.r_lo)
-    local x1 = cell.c_hi * (cell_w - 1) + 1
-    local y1 = cell.r_hi * (cell_h - 1) + 1
-    local interior_w = x1 - x0 - 1
-    local interior_h = y1 - y0 - 1
-    local content = { center_text(label, interior_w), center_text(name, interior_w) }
-    local top_pad = math.max(0, math.floor((interior_h - #content) / 2))
-    for i, line in ipairs(content) do
-      local y = y0 + top_pad + i
-      if y < y1 then
-        local chars = vim.fn.split(line, "\\zs")
-        for j = 1, math.min(#chars, interior_w) do
-          buf[y][x0 + j] = chars[j]
-        end
-      end
-    end
-  end
-
-  local lines = {}
-  for y = 1, total_h do
-    local row = table.concat(buf[y]):gsub("%s+$", "")
-    table.insert(lines, row)
-  end
-  while #lines > 0 and lines[#lines] == "" do
-    table.remove(lines)
-  end
-  return lines
-end
-
-local function open_picker_floating(lines, on_key)
-  local buf = vim.api.nvim_create_buf(false, true)
-  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
-  vim.bo[buf].modifiable = false
-  vim.bo[buf].bufhidden = "wipe"
-
-  local width = 0
-  for _, line in ipairs(lines) do
-    width = math.max(width, vim.fn.strdisplaywidth(line))
-  end
-  local height = #lines
-  local ui = vim.api.nvim_list_uis()[1] or { width = vim.o.columns, height = vim.o.lines }
-  local row = math.max(0, math.floor((ui.height - height) / 2))
-  local col = math.max(0, math.floor((ui.width - width) / 2))
-
-  local win = vim.api.nvim_open_win(buf, false, {
-    relative = "editor",
-    row = row,
-    col = col,
-    width = width,
-    height = height,
-    style = "minimal",
-    border = "none",
-    focusable = false,
-    noautocmd = true,
-  })
-
-  vim.cmd("redraw")
-  local ok, ch = pcall(vim.fn.getcharstr)
-  if vim.api.nvim_win_is_valid(win) then
-    vim.api.nvim_win_close(win, true)
-  end
-  if ok then
-    on_key(ch)
-  end
+  return tonumber(output)
 end
 
 ---@class KittyAgentPickerSelection
@@ -690,68 +182,27 @@ function M.pick(opts, callback)
   local target = normalize_target(opts.target)
   local display_name = M.config.targets[target].display_name
 
-  local topo = collect_tab_topology(target)
-  if not topo then
+  local found = collect_target_windows(target)
+  if not found or #found.targets == 0 then
     callback(nil)
     return
   end
 
-  local target_group_ids = {}
-  for gid, meta in pairs(topo.group_meta) do
-    if meta.is_target and gid ~= topo.self_group_id then
-      table.insert(target_group_ids, gid)
-    end
-  end
-
-  if #target_group_ids == 0 then
-    callback(nil)
+  if #found.targets == 1 then
+    callback(selection_from_meta(found.targets[1], display_name))
     return
   end
 
-  if #target_group_ids == 1 then
-    local meta = topo.group_meta[target_group_ids[1]]
-    remember_last_window(target, meta)
-    callback({ id = meta.window_id, cwd = meta.cwd, title = meta.title, agent_name = meta.agent_name or display_name })
-    return
-  end
-
-  local positions = compute_layout(topo.self_group_id, topo.group_neighbors)
-  local spans = compute_spans(positions, topo.group_neighbors)
-  local keymap, group_keys, available =
-    assign_direction_keys(target_group_ids, positions, topo.group_meta, topo.history_rank)
-  local default_group_id = find_last_group_id(target, target_group_ids, topo.group_meta)
-  local grid_lines = render_layout_grid(spans, topo.self_group_id, topo.group_meta, group_keys, default_group_id)
-
-  table.insert(grid_lines, "")
-  table.insert(
-    grid_lines,
-    "Pick "
-      .. display_name
-      .. ": "
-      .. table.concat(available, "/")
-      .. (default_group_id and "/Enter" or "")
-      .. "  (Esc to cancel) - approximate layout"
-  )
-
-  open_picker_floating(grid_lines, function(ch)
-    local gid = keymap[ch]
-    if not gid and (ch == "\r" or ch == "\n") then
-      gid = default_group_id
-    end
-    if not gid then
-      return
-    end
-    local meta = topo.group_meta[gid]
-    remember_last_window(target, meta)
-    callback({ id = meta.window_id, cwd = meta.cwd, title = meta.title, agent_name = meta.agent_name or display_name })
-  end)
+  local selected_id = select_window_id(display_name)
+  local meta = selected_id and found.targets_by_id[selected_id] or nil
+  callback(meta and selection_from_meta(meta, display_name) or nil)
 end
 
 M._private = {
-  compute_layout = compute_layout,
-  compute_spans = compute_spans,
-  assign_direction_keys = assign_direction_keys,
-  center_text = center_text,
+  collect_target_windows = collect_target_windows,
+  detect_agent_name = detect_agent_name,
+  select_window_id = select_window_id,
+  window_matches_target = window_matches_target,
 }
 
 return M
